@@ -1118,14 +1118,25 @@ out1:
 
 struct timeseries {
     time_t t_start, t_end, t_step; // inclusive limits
+    string name;
+    string legend; // name + etc. for legend
     vector<float> data;
+    pmDesc desc; // for underlying pcp time series
+    bool desc_valid; // ... but only if this is set
+    // XXX: other rendering parameters like rgb,alpha may come from graphite function()s
 
     timeseries(time_t a, time_t b, time_t c):
         t_start(a), t_end(b), t_step(c),
-        data((size_t) (b-a)/c+1, nanf(""))
+        data((size_t) (b-a)/c+1, nanf("")), desc_valid(false)
     {
     }
 
+    void set_desc(const pmDesc &d)
+    {
+        desc = d;
+        desc_valid = true;
+    }
+    
     const float& at(time_t t) const
     {
         assert(t >= t_start && t <= t_end);
@@ -1192,6 +1203,7 @@ void timeseries_rateconvert(timeseries& ts)
     ts.data = rated_data;
 }
 
+
 // Convert all NaNs to given value
 void timeseries_nullconvert(timeseries& ts, float v)
 {
@@ -1207,9 +1219,7 @@ struct fetch_series_jobspec {
     vector<pthread_mutex_t*> output_locks; // protection for the individual 'rows' of output
 #endif
     vector<timeseries*> outputs;
-    vector<pmDesc*> output_descs;
 
-    vector<metric_string> targets;
     string filename; // archive filename
     time_t t_start, t_end, t_step;
     string message; // may have error or verbose message
@@ -1328,9 +1338,8 @@ void pmgraphite_fetch_series (fetch_series_jobspec *spec)
 {
     assert (spec != NULL);
     assert (spec->outputs.size() > 0);
-    assert (spec->targets.size() == spec->outputs.size());
 
-    // vectors are indexed parallel with spec->targets[] == spec->outputs[]
+    // vectors are indexed parallel with spec->outputs[]
     time_t t_start = spec->t_start;
     time_t t_end = spec->t_end;
     time_t t_step = spec->t_step;
@@ -1397,15 +1406,15 @@ void pmgraphite_fetch_series (fetch_series_jobspec *spec)
 
     // -------------------- PART 2 - per-metric metadata processing
 
-    pmids.resize(spec->targets.size());
-    pmdescs.resize(spec->targets.size());
-    pminsts.resize(spec->targets.size());
+    pmids.resize(spec->outputs.size());
+    pmdescs.resize(spec->outputs.size());
+    pminsts.resize(spec->outputs.size());
 
-    for (unsigned j=0; j<spec->targets.size(); j++) {
+    for (unsigned j=0; j<spec->outputs.size(); j++) {
         if (exit_p)
             break;
 
-        const metric_string& target = spec->targets[j];
+        const metric_string& target = spec->outputs[j]->name;
         pmids[j] = 0; // always invalid
 
         const vector<string>& target_tok = target.split();
@@ -1506,16 +1515,15 @@ void pmgraphite_fetch_series (fetch_series_jobspec *spec)
             continue;
         }
 
-        pmids[j] = pmidlist[0]; // Now we're committed to trying to fetch this pmid.
-
-        // supply the pmDesc to caller
 #ifdef HAVE_PTHREAD_H
         pthread_mutex_lock (spec->output_locks[j]);
 #endif
-        *(spec->output_descs[j]) = pmdescs[j];
+        (*spec->outputs[j]).set_desc(pmdescs[j]);
 #ifdef HAVE_PTHREAD_H
         pthread_mutex_unlock (spec->output_locks[j]);
 #endif
+        
+        pmids[j] = pmidlist[0]; // Now we're committed to trying to fetch this pmid.
     }
 
     // -------------------- PART 3 - giant fetch loop
@@ -1564,7 +1572,7 @@ void pmgraphite_fetch_series (fetch_series_jobspec *spec)
                 assert ((size_t)result->numpmid == unique_pmids.size()); // PMAPI guarantee?
 
                 // search them all for matching pmid/inst tuples
-                for (unsigned i=0; i<spec->targets.size(); i++) {
+                for (unsigned i=0; i<spec->outputs.size(); i++) {
                     for (unsigned j=0; j<unique_pmids.size(); j++) { // for indexing over result->vset
                         if (result->vset[j]->pmid != pmids[i])
                             continue;
@@ -1606,8 +1614,8 @@ void pmgraphite_fetch_series (fetch_series_jobspec *spec)
     } // iterate over time
 
     if ((verbosity > 3) || (verbosity > 2 && entries_good > 0)) {
-        message << spec->targets.size() << " targets(s) (" << pmids_set.size() << " unique metrics)";
-        message << ", " << entries_good << "/" << entries*spec->targets.size() << " values";
+        message << spec->outputs.size() << " targets(s) (" << pmids_set.size() << " unique metrics)";
+        message << ", " << entries_good << "/" << entries*spec->outputs.size() << " values";
     }
 
  out:
@@ -1628,24 +1636,18 @@ void pmgraphite_fetch_series (fetch_series_jobspec *spec)
 
 void
 pmgraphite_fetch_all_series (struct MHD_Connection* connection,
-                             const vector<metric_string>& targets,
-                             vector<timeseries>& outputs,
-                             vector<pmDesc>& output_descs,
-                             time_t t_start, time_t t_end, time_t t_step)
+                             vector<timeseries*>& outputs)
 {
-    // create some jobspecs, one per archive
-    // with many little empty vectors inside
-    outputs.resize(targets.size(), timeseries(t_start,t_end,t_step));
-    output_descs.resize(targets.size());
     map <string, fetch_series_jobspec> jobmap;
 #ifdef HAVE_PTHREAD_H
-    vector <pthread_mutex_t> output_locks(targets.size());
-    for (unsigned i=0; i<targets.size(); i++)
+    vector <pthread_mutex_t> output_locks(outputs.size());
+    for (unsigned i=0; i<outputs.size(); i++)
         pthread_mutex_init(& output_locks[i], NULL);
 #endif
 
-    for (unsigned i = 0; i < targets.size (); i++) {
-        const metric_string& target = targets[i];
+    for (unsigned i = 0; i < outputs.size (); i++) {
+        timeseries* output = outputs[i];
+        const metric_string& target = outputs[i]->name;
         const vector<string>& target_tok = target.split();
 
         // We used to reject target_tok.size() < 2 here, because it's
@@ -1666,28 +1668,19 @@ pmgraphite_fetch_all_series (struct MHD_Connection* connection,
             // Already rejected mismatching archivepart
             assert (target_tok[0] == e->archivepart);
             // Reject out-of-bounds time
-            if (e->archive_end.tv_sec < t_start)
+            if (e->archive_end.tv_sec < output->t_start)
                 continue;
-            if (e->archive_begin.tv_sec > t_end)
+            if (e->archive_begin.tv_sec > output->t_end)
                 continue;
 
             // handle ._ pseudo-metric here, so we don't even have to spin up
             // threads & risk pmNewContext-opening archives, just to enumerate
             if (target_tok[1] == "_" && target_tok.size() == 2) {
-                // invent a pmDesc - but only the parts used
-                output_descs[i].sem = PM_SEM_INSTANT;
-                output_descs[i].units.scaleSpace = 0;
-                output_descs[i].units.scaleTime = 0;
-                output_descs[i].units.scaleCount = 0;
-                output_descs[i].units.dimSpace = 0;
-                output_descs[i].units.dimTime = 0;
-                output_descs[i].units.dimCount = 1;
-
                 // set to 0 the time interval that overlaps the archive's timespan and the query timespan
-                for (time_t w = max(t_start,e->archive_begin.tv_sec);
-                     w <= min(t_end,e->archive_end.tv_sec);
-                     w += t_step)
-                    (outputs[i]).at(w) = 0;
+                for (time_t w = max(output->t_start, e->archive_begin.tv_sec);
+                     w <= min(output->t_end, e->archive_end.tv_sec);
+                     w += output->t_step)
+                    output->at(w) = 0;
                 
                 // skip rest of jobmap etc. processing
                 continue;
@@ -1696,19 +1689,17 @@ pmgraphite_fetch_all_series (struct MHD_Connection* connection,
             map<string,fetch_series_jobspec>::iterator it2 = jobmap.find(e->filename);
             if (it2 == jobmap.end()) {
                 fetch_series_jobspec js;
-                js.t_start = t_start;
-                js.t_end = t_end;
-                js.t_step = t_step;
+                js.t_start = output->t_start;
+                js.t_end = output->t_end;
+                js.t_step = output->t_step;
                 js.filename = e->filename;
                 it2 = jobmap.insert(make_pair(e->filename,js)).first;
             }
 
-            it2->second.targets.push_back (target);
+            it2->second.outputs.push_back (outputs[i]);
 #ifdef HAVE_PTHREAD_H
             it2->second.output_locks.push_back (& output_locks[i]);
 #endif
-            it2->second.outputs.push_back (& outputs[i]);
-            it2->second.output_descs.push_back (& output_descs[i]);
         }
     }
 
@@ -1728,7 +1719,7 @@ pmgraphite_fetch_all_series (struct MHD_Connection* connection,
     // ... aaaand it's gone
 
 #ifdef HAVE_PTHREAD_H
-    for (unsigned i=0; i<targets.size(); i++)
+    for (unsigned i=0; i<outputs.size(); i++)
         pthread_mutex_destroy(& output_locks[i]);
 #endif
 
@@ -1739,23 +1730,116 @@ pmgraphite_fetch_all_series (struct MHD_Connection* connection,
             connstamp (clog, connection) << message << endl;
         }
     }
-
-    // rate conversion
-    // NB: this is where we could deal with other functiosn
-    for (unsigned i=0; i<targets.size(); i++)
-        if (output_descs[i].sem == PM_SEM_COUNTER)
-            timeseries_rateconvert(outputs[i]);
-
+    
     if (verbosity > 1) {
-        connstamp (clog, connection) << "digested " << targets.size () << " metric(s)"
+        connstamp (clog, connection) << "digested " << outputs.size () << " metric(s)"
                                      << " over " << number_of_jobs << " archive(s)"
-                                     << ", timespan [" << t_start << "-" << t_end
-                                     << " by " << t_step << "]"
                                      << ", in " << pmtimevalSub (&finish,&start)*1000 << "ms "
                                      << endl;
     }
+}
 
-    assert (outputs.size () == targets.size ());
+
+
+/* ------------------------------------------------------------------------ */
+
+// A node in the graphite function expression tree.
+//
+// During its constructor, it must populate outputs[] with the correct number of time series.
+// (The time series contents - values - will naturally change as they are filled in later.)
+//
+// XXX: how to handle errors?
+
+struct pmg_function
+{
+    pmg_function() {}
+    virtual ~pmg_function() {}
+
+    string output_errors;
+    vector<timeseries> outputs;
+
+    virtual void evaluate() = 0;
+};
+
+
+struct pmg_function_pcp_metric: public pmg_function
+{
+    pmg_function_pcp_metric(struct MHD_Connection* conn,
+                            const string& wildcard, vector<timeseries*>& pcp_series,
+                            time_t t_start, time_t t_end, time_t t_step)
+    {
+        // The patterns may have wildcards; expand the bad boys - and restrict to the start/end times
+        vector<metric_string> metrics = pmgraphite_enumerate_metrics (conn, wildcard, t_start, t_end);
+        if (exit_p)
+            return;
+        
+        // NB: the entries in enumerated metrics[] may be wider than
+        // the incoming pattern, for example for a wildcard like *.*
+        // We need to filter out those enumerated ones that are longer
+        // (have more dot-components) than the incoming pattern.
+        unsigned pattern_length = count (wildcard.begin (), wildcard.end (), '.');
+        unsigned num_matching_metrics = 0;
+        for (mvi_t it = metrics.begin(); it != metrics.end(); it++)
+            if (pattern_length == it->split_size()-1)
+                num_matching_metrics ++;
+        outputs.resize(num_matching_metrics, timeseries(t_start, t_end, t_step));
+
+        // We're done allocating/changing outputs[], so now
+        // taking/sharing pointers into it is safe.
+        unsigned m = 0;
+        for (mvi_t it = metrics.begin(); it != metrics.end(); it++)
+            if (pattern_length == it->split_size()-1) {
+                outputs[m].name = it->unsplit(); // identify metric we want
+                pcp_series.push_back (& outputs[m]); // non-owning pointer
+                m++;
+            }
+    }
+
+    void evaluate()
+    {
+        // nothing to do - the initial fetching stage did apprx. everything
+    }
+};
+
+
+// parse given function expression; append needed pcp time series to inputs[]
+// and maintain their add
+pmg_function*
+pmgf_compile(struct MHD_Connection* conn,
+             const string& function, vector<timeseries*>& inputs,
+             time_t t_start, time_t t_end, time_t t_step)
+{
+    // XXX: do real parse
+    pmg_function_pcp_metric* f = new pmg_function_pcp_metric(conn, function, inputs, t_start, t_end, t_step);
+    return f;
+}
+
+
+void
+pmgraphite_fetch_all_functions (struct MHD_Connection* connection,
+                                const vector<string>& target_functions,
+                                vector<timeseries>& outputs,
+                                time_t t_start, time_t t_end, time_t t_step)
+{
+    vector<timeseries*> pcp_series; // one per pcp timeseries required by any node in any functions[]
+    // NB: non-owning timeseries pointers; the pmg_function owns them
+
+    vector<pmg_function*> functions; // one per target_function[]
+    for (unsigned i=0; i<target_functions.size(); i++)
+        functions.push_back(pmgf_compile(connection, target_functions[i], pcp_series, t_start, t_end, t_step));
+    
+    pmgraphite_fetch_all_series (connection, pcp_series);
+
+    for (unsigned i=0; i<functions.size(); i++) {
+        pmg_function* f = functions[i];
+        f->evaluate();
+        // copy out the results
+        outputs.insert(outputs.end(), f->outputs.begin(), f->outputs.end());
+    }
+
+    // free up the functions[], and their owned timeseries
+    for (unsigned i=0; i<functions.size(); i++)
+        delete functions[i];
 }
 
 
@@ -1845,7 +1929,7 @@ int
 pmgraphite_gather_data (struct MHD_Connection *connection,
                         const http_params & params,
                         const vector <string> &/*url*/,
-                        vector<metric_string>& targets,
+                        vector<string>& targets,
                         time_t& t_start,
                         time_t& t_end,
                         time_t& t_step,
@@ -1853,7 +1937,7 @@ pmgraphite_gather_data (struct MHD_Connection *connection,
 {
     int rc = 0;
 
-    vector<string> target_patterns = params.find_all ("target");
+    targets = params.find_all ("target");
 
     // same defaults as python graphite/graphlot/views.py
     string from = params["from"];
@@ -1874,24 +1958,6 @@ pmgraphite_gather_data (struct MHD_Connection *connection,
         return -EINVAL;
     }
 
-    // The patterns may have wildcards; expand the bad boys - and restrict to the start/end times
-    for (unsigned i=0; i<target_patterns.size (); i++) {
-        unsigned pattern_length = count (target_patterns[i].begin (), target_patterns[i].end (), '.');
-        vector<metric_string> metrics = pmgraphite_enumerate_metrics (connection, target_patterns[i], t_start, t_end);
-        if (exit_p) {
-            break;
-        }
-
-        // NB: the entries in enumerated metrics[] may be wider than
-        // the incoming pattern, for example for a wildcard like *.*
-        // We need to filter out those enumerated ones that are longer
-        // (have more dot-components) than the incoming pattern.
-
-        for (mvi_t it = metrics.begin(); it != metrics.end(); it++) {
-            if (pattern_length == it->split_size()-1)
-                targets.push_back (*it);
-            }
-    }
 
     // Compute t_step.  Because we calculate with integers, the
     // minimum is 1.  The practical minimum is something dependent on
@@ -2346,7 +2412,6 @@ pmgraphite_respond_render_gfx (struct MHD_Connection *connection,
     cairo_surface_t *sfc;
     cairo_t *cr;
     vector<timeseries> all_results;
-    vector<pmDesc> all_result_descs;
     string colorList;
     vector<string> colors;
     string bgcolor;
@@ -2367,7 +2432,7 @@ pmgraphite_respond_render_gfx (struct MHD_Connection *connection,
         return mhd_notify_error (connection, -EINVAL);
     }
 
-    vector<metric_string> targets;
+    vector<string> targets;
     time_t t_start, t_end, t_step;
     int t_relative_p;
     rc = pmgraphite_gather_data (connection, params, url, targets, t_start, t_end, t_step, t_relative_p);
@@ -2428,12 +2493,18 @@ pmgraphite_respond_render_gfx (struct MHD_Connection *connection,
     }
 
     // Gather up all the data.  We need several passes over it, so gather it into a vector<vector<> >.
-    (void) pmgraphite_fetch_all_series (connection, targets, all_results, all_result_descs, t_start, t_end, t_step);
+    pmgraphite_fetch_all_functions (connection, targets, all_results, t_start, t_end, t_step);
 
     if (exit_p) {
         return MHD_NO;
     }
 
+    // rate conversion if raw pcp stuff got through
+    for (unsigned i=0; i<all_results.size(); i++)
+        if (all_results[i].desc_valid &&
+            all_results[i].desc.sem == PM_SEM_COUNTER)
+            timeseries_rateconvert(all_results[i]);
+    
     if (params["drawNullAsZero"] == "true") {
         for (unsigned i=0; i<all_results.size (); i++)
             timeseries_nullconvert (all_results[i], 0);
@@ -2566,8 +2637,8 @@ pmgraphite_respond_render_gfx (struct MHD_Connection *connection,
         // as per graphite render/glyph.py defaultGraphOptions
         colorList = "blue,green,red,purple,brown,yellow,aqua,grey,magenta,pink,gold,mistyrose";
     }
-    colors = generate_colorlist (split (colorList,','), targets.size ());
-    assert (colors.size () == targets.size ());
+    colors = generate_colorlist (split (colorList,','), all_results.size ());
+    assert (colors.size () == all_results.size ());
 
     // Draw the title
     if (params["title"] != "") {
@@ -2659,13 +2730,15 @@ pmgraphite_respond_render_gfx (struct MHD_Connection *connection,
 
     // Draw the legend
     if (params["hideLegend"] != "true" && params["graphOnly"] != "true" &&
-            (params["hideLegend"] == "false" || targets.size () <= 10)) { // maximum number of legend entries
+            (params["hideLegend"] == "false" || all_results.size () <= 10)) { // maximum number of legend entries
         double spacing = 10.0;
         double baseline = height - 8.0;
         double leftedge = 10.0;
 
         for (unsigned i=0; i<visibility_rank.size (); i++) {
             // compute legend string
+            const string name = all_results[visibility_rank[i]].name;
+#if 0 /* PMDESC */
             const metric_string& metric_name = targets[visibility_rank[i]];
             const char* metric_units = pmUnitsStr(&all_result_descs[visibility_rank[i]].units);
             string name;
@@ -2677,6 +2750,7 @@ pmgraphite_respond_render_gfx (struct MHD_Connection *connection,
 
             if (all_result_descs[visibility_rank[i]].sem == PM_SEM_COUNTER)
                 name += " rate";
+#endif
 
             double r, g, b;
 
@@ -2996,7 +3070,7 @@ pmgraphite_respond_render_json (struct MHD_Connection *connection,
     int rc;
     struct MHD_Response *resp;
 
-    vector<metric_string> targets;
+    vector<string> targets;
     time_t t_start, t_end, t_step;
     int t_relative_p;
     rc = pmgraphite_gather_data (connection, params, url, targets, t_start, t_end, t_step, t_relative_p);
@@ -3005,13 +3079,18 @@ pmgraphite_respond_render_json (struct MHD_Connection *connection,
     }
 
     vector<timeseries> all_results; // indexed as targets[]
-    vector<pmDesc> all_result_descs; // indexed as targets[]
-    pmgraphite_fetch_all_series (connection, targets, all_results, all_result_descs, t_start, t_end, t_step);
+    pmgraphite_fetch_all_functions (connection, targets, all_results, t_start, t_end, t_step);
 
+    // rate conversion if raw pcp stuff got through
+    for (unsigned i=0; i<all_results.size(); i++)
+        if (all_results[i].desc_valid &&
+            all_results[i].desc.sem == PM_SEM_COUNTER)
+            timeseries_rateconvert(all_results[i]);
+    
     stringstream output;
     output << "[";
-    for (unsigned k = 0; k < targets.size (); k++) {
-        const metric_string& target = targets[k];
+    for (unsigned k = 0; k < all_results.size (); k++) {
+        const metric_string& target = all_results[k].name;
         const timeseries& results = all_results[k];
 
         if (k > 0) {
