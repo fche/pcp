@@ -929,7 +929,7 @@ if __name__ == '__main__':
                                          formatter_class=argparse.ArgumentDefaultsHelpFormatter)
         parser.add_argument('-c','--config',
                             type=str,
-                            default=os.getenv('PCP_PMDAS_DIR')+'/prometheus/config.d',
+                            default=os.getenv('PCP_PMDAS_DIR')+'/prometheus/urls.d', # OSIO practice
                             help='configuration directory')
         parser.add_argument('-t','--timeout',
                             type=int,
